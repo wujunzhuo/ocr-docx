@@ -24,16 +24,43 @@ DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingm
 
 
 @lru_cache(maxsize=1)
-def load_pps_model():
-    return PPStructure()
+def load_ocr_model(is_structure=True):
+    if is_structure:
+        return PPStructure()
+    else:
+        return PaddleOCR(use_angle_cls=True)
 
 
-def invoke_ocr_structure(content):
-    engine = load_pps_model()
+def invoke_ocr_structure(tmpdir, img_paths, img_name):
+    engine = load_ocr_model()
+    all_res = []
+    for index, (_, img) in enumerate(img_paths):
+        print(f"processing {index + 1}/{len(img_paths)} page:")
+        result = engine(img, img_idx=index)
+        save_structure_res(result, tmpdir, img_name, index)
+        all_res += sorted_layout_boxes(result, img.shape[1])
 
+    convert_info_docx(img, all_res, tmpdir, img_name)
+
+    with open(os.path.join(tmpdir, img_name+"_ocr.docx"), "rb") as f:
+        return f.read()
+
+
+def image_to_docx(content, suffix):
     with TemporaryDirectory() as tmpdir:
         img_name = "a"
-        img_path = os.path.join(tmpdir, img_name + ".pdf")
+        img_path = os.path.join(tmpdir, f"{img_name}.{suffix}")
+        with open(img_path, "wb") as f:
+            f.write(content)
+        img = cv2.imread(img_path)
+        img_paths = [[img_path, img]]
+        return invoke_ocr_structure(tmpdir, img_paths, img_name)
+
+
+def pdf_to_docx(content):
+    with TemporaryDirectory() as tmpdir:
+        img_name = "a"
+        img_path = os.path.join(tmpdir, f"{img_name}.pdf")
         with open(img_path, "wb") as f:
             f.write(content)
         img, _, _ = check_and_read(img_path)
@@ -42,29 +69,12 @@ def invoke_ocr_structure(content):
         for index, pdf_img in enumerate(img):
             os.makedirs(os.path.join(tmpdir, img_name), exist_ok=True)
             pdf_img_path = os.path.join(
-                tmpdir, img_name, img_name + "_" + str(index) + ".jpg"
+                tmpdir, img_name, f"{img_name}_{index}.jpg"
             )
             cv2.imwrite(pdf_img_path, pdf_img)
             img_paths.append([pdf_img_path, pdf_img])
 
-        all_res = []
-        for index, (_, img) in enumerate(img_paths):
-            print(f"processing {index + 1}/{len(img_paths)} page:")
-            result = engine(img, img_idx=index)
-            save_structure_res(result, tmpdir, img_name, index)
-            all_res += sorted_layout_boxes(result, img.shape[1])
-
-        convert_info_docx(img, all_res, tmpdir, img_name)
-
-        with open(os.path.join(tmpdir, img_name+"_ocr.docx"), "rb") as f:
-            return f.read()
-
-
-@lru_cache(maxsize=1)
-def load_ocr_model():
-    # model = PaddleOCR(use_angle_cls=True, lang='en')
-    model = PaddleOCR(use_angle_cls=True)
-    return model
+        return invoke_ocr_structure(tmpdir, img_paths, img_name)
 
 
 def merge_data(values):
@@ -81,7 +91,7 @@ def invoke_ocr(doc, content_type):
     print(f"Handling OCR request with worker PID: {worker_pid}")
     start_time = time.time()
 
-    model = load_ocr_model()
+    model = load_ocr_model(False)
 
     bytes_img = io.BytesIO()
     format_img = "JPEG"
@@ -113,8 +123,10 @@ router = APIRouter()
 
 
 @router.post("/inference")
-async def inference(file: UploadFile = File(None),
-                    image_url: Optional[str] = Form(None)):
+async def inference(
+    file: UploadFile = File(None),
+    image_url: Optional[str] = Form(None),
+):
     result = None
     if file:
         if file.content_type in ["image/jpeg", "image/jpg", "image/png"]:
@@ -168,14 +180,20 @@ async def inference(file: UploadFile = File(None),
 
 @router.post("/doc")
 async def doc(file: UploadFile = File()):
-    if file.content_type in ["application/pdf", "application/octet-stream"]:
-        pdf_bytes = await file.read()
-        result = invoke_ocr_structure(pdf_bytes)
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file type. (JPG/PNG/PDF)",
-        )
+    data = await file.read()
+
+    match file.content_type:
+        case "image/jpeg" | "image/jpg":
+            result = image_to_docx(data, "jpg")
+        case "image/png":
+            result = image_to_docx(data, "png")
+        case "application/pdf" | "application/octet-stream":
+            result = pdf_to_docx(data)
+        case _:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file type. (JPG/PNG/PDF)",
+            )
 
     return Response(
         status_code=status.HTTP_200_OK,
